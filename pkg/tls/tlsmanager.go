@@ -117,7 +117,7 @@ func (m *Manager) UpdateConfigs(ctx context.Context, stores map[string]Store, co
 		m.storesConfig[tlsalpn01.ACMETLS1Protocol] = Store{}
 	}
 
-	storesCertificates := make(map[string]map[string]*CertificateData)
+	storesCertificates := make(map[string]dynamicCertificates)
 
 	// Define the TTL for all the cache entries with no TTL.
 	// This will discard entries that are not used anymore.
@@ -311,17 +311,19 @@ func (m *Manager) GetServerCertificates() map[string]*x509.Certificate {
 
 	// We iterate over all the certificates.
 	if defaultStore.DynamicCerts != nil && defaultStore.DynamicCerts.Get() != nil {
-		certs, ok := defaultStore.DynamicCerts.Get().(map[string]*CertificateData)
+		certs, ok := defaultStore.DynamicCerts.Get().(dynamicCertificates)
 		if ok {
-			for _, cert := range certs {
-				// Use Leaf if available (it should always be populated by parseCertificate)
-				if cert.Certificate.Leaf == nil {
-					log.Warn().Msg("TLS: certificate Leaf is nil, skipping certificate in API response")
-					continue
+			for _, certificatesForDomains := range certs {
+				for _, cert := range certificatesForDomains {
+					// Use Leaf if available (it should always be populated by parseCertificate)
+					if cert.Certificate.Leaf == nil {
+						log.Warn().Msg("TLS: certificate Leaf is nil, skipping certificate in API response")
+						continue
+					}
+					hash := sha256.Sum256(cert.Certificate.Leaf.Raw)
+					fingerprint := hex.EncodeToString(hash[:])
+					certificates[fingerprint] = cert.Certificate.Leaf
 				}
-				hash := sha256.Sum256(cert.Certificate.Leaf.Raw)
-				fingerprint := hex.EncodeToString(hash[:])
-				certificates[fingerprint] = cert.Certificate.Leaf
 			}
 		}
 	}

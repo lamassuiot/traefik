@@ -1,6 +1,7 @@
 package tls
 
 import (
+	"bytes"
 	"crypto/tls"
 	"fmt"
 	"maps"
@@ -21,24 +22,28 @@ type CertificateData struct {
 	Certificate *tls.Certificate
 }
 
+type dynamicCertificates map[string][]*CertificateData
+
 // CertificateStore store for dynamic certificates.
 type CertificateStore struct {
 	DynamicCerts       *safe.Safe
 	DefaultCertificate *CertificateData
 	CertCache          *cache.Cache
 
-	ocspStapler *ocspStapler
+	certificateCandidatesCache *cache.Cache
+	ocspStapler                *ocspStapler
 }
 
 // NewCertificateStore create a store for dynamic certificates.
 func NewCertificateStore(ocspStapler *ocspStapler) *CertificateStore {
 	var dynamicCerts safe.Safe
-	dynamicCerts.Set(make(map[string]*CertificateData))
+	dynamicCerts.Set(make(dynamicCertificates))
 
 	return &CertificateStore{
-		DynamicCerts: &dynamicCerts,
-		CertCache:    cache.New(1*time.Hour, 10*time.Minute),
-		ocspStapler:  ocspStapler,
+		DynamicCerts:               &dynamicCerts,
+		CertCache:                  cache.New(1*time.Hour, 10*time.Minute),
+		certificateCandidatesCache: cache.New(1*time.Hour, 10*time.Minute),
+		ocspStapler:                ocspStapler,
 	}
 }
 
@@ -48,7 +53,7 @@ func (c *CertificateStore) GetAllDomains() []string {
 
 	// Get dynamic certificates
 	if c.DynamicCerts != nil && c.DynamicCerts.Get() != nil {
-		for domain := range c.DynamicCerts.Get().(map[string]*CertificateData) {
+		for domain := range c.DynamicCerts.Get().(dynamicCertificates) {
 			allDomains = append(allDomains, domain)
 		}
 	}
@@ -73,7 +78,7 @@ func (c *CertificateStore) GetDefaultCertificate() *tls.Certificate {
 	return c.DefaultCertificate.Certificate
 }
 
-// GetBestCertificate returns the best match certificate, and caches the response.
+// GetBestCertificate returns a hostname-valid certificate selected according to the client's signature scheme preferences.
 func (c *CertificateStore) GetBestCertificate(clientHello *tls.ClientHelloInfo) *tls.Certificate {
 	if c == nil {
 		return nil
@@ -89,47 +94,74 @@ func (c *CertificateStore) GetBestCertificate(clientHello *tls.ClientHelloInfo) 
 		serverName = strings.TrimSpace(host)
 	}
 
-	if cert, ok := c.CertCache.Get(serverName); ok {
-		certificateData := cert.(*CertificateData)
-		if c.ocspStapler != nil && certificateData.Hash != "" {
-			if staple, ok := c.ocspStapler.GetStaple(certificateData.Hash); ok {
-				// We are updating the OCSPStaple of the certificate without any synchronization
-				// as this should not cause any issue.
-				certificateData.Certificate.OCSPStaple = staple
-			}
+	var candidates []*CertificateData
+	if c.certificateCandidatesCache != nil {
+		if cached, ok := c.certificateCandidatesCache.Get(serverName); ok {
+			candidates = cached.([]*CertificateData)
 		}
-
-		return certificateData.Certificate
 	}
 
-	if c.DynamicCerts != nil && c.DynamicCerts.Get() != nil {
-		certs := c.DynamicCerts.Get().(map[string]*CertificateData)
-		// sorted cert sans identifiers
+	if candidates == nil && c.DynamicCerts != nil && c.DynamicCerts.Get() != nil {
+		candidates = make([]*CertificateData, 0)
+		certs := c.DynamicCerts.Get().(dynamicCertificates)
+		// Preserve the existing exact-name-before-wildcard precedence when certificates support the same signature scheme.
 		sorted := slices.SortedFunc(maps.Keys(certs), func(certKey string, certKey2 string) int {
-			// reverse sort.
 			return strings.Compare(certKey2, certKey)
 		})
 
 		for _, certDomains := range sorted {
 			if matchDomain(serverName, certDomains) {
-				// cache best match
-				certificateData := certs[certDomains]
-				c.CertCache.SetDefault(serverName, certificateData)
+				candidates = append(candidates, certs[certDomains]...)
+			}
+		}
 
-				if c.ocspStapler != nil && certificateData.Hash != "" {
-					if staple, ok := c.ocspStapler.GetStaple(certificateData.Hash); ok {
-						// We are updating the OCSPStaple of the certificate without any synchronization
-						// as this should not cause any issue.
-						certificateData.Certificate.OCSPStaple = staple
-					}
-				}
+		if c.certificateCandidatesCache != nil {
+			c.certificateCandidatesCache.SetDefault(serverName, candidates)
+		}
+	}
 
-				return certificateData.Certificate
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	// Do not cache this result because clients for the same hostname can advertise different signature schemes.
+	// Trying one signature scheme at a time makes the client preference order
+	// drive certificate selection while SupportsCertificate applies all the
+	// other TLS compatibility checks.
+	for _, signatureScheme := range clientHello.SignatureSchemes {
+		probe := *clientHello
+		probe.SignatureSchemes = []tls.SignatureScheme{signatureScheme}
+
+		for _, candidate := range candidates {
+			if err := probe.SupportsCertificate(candidate.Certificate); err == nil {
+				return c.prepareCertificate(candidate)
 			}
 		}
 	}
 
-	return nil
+	if len(clientHello.SignatureSchemes) == 0 {
+		for _, candidate := range candidates {
+			if err := clientHello.SupportsCertificate(candidate.Certificate); err == nil {
+				return c.prepareCertificate(candidate)
+			}
+		}
+	}
+
+	// Match crypto/tls fallback behavior so the handshake reports the actual
+	// incompatibility instead of falling back to an unrelated default certificate.
+	return c.prepareCertificate(candidates[0])
+}
+
+func (c *CertificateStore) prepareCertificate(certificateData *CertificateData) *tls.Certificate {
+	if c.ocspStapler != nil && certificateData.Hash != "" {
+		if staple, ok := c.ocspStapler.GetStaple(certificateData.Hash); ok {
+			// We are updating the OCSPStaple of the certificate without any synchronization
+			// as this should not cause any issue.
+			certificateData.Certificate.OCSPStaple = staple
+		}
+	}
+
+	return certificateData.Certificate
 }
 
 // GetCertificate returns the first certificate matching all the given domains.
@@ -146,8 +178,9 @@ func (c *CertificateStore) GetCertificate(domains []string) *CertificateData {
 	}
 
 	if c.DynamicCerts != nil && c.DynamicCerts.Get() != nil {
-		for certDomains, cert := range c.DynamicCerts.Get().(map[string]*CertificateData) {
+		for certDomains, certificates := range c.DynamicCerts.Get().(dynamicCertificates) {
 			if domainsKey == certDomains {
+				cert := certificates[0]
 				c.CertCache.SetDefault(domainsKey, cert)
 				return cert
 			}
@@ -162,6 +195,7 @@ func (c *CertificateStore) GetCertificate(domains []string) *CertificateData {
 			}
 
 			if len(matchedDomains) == len(domains) {
+				cert := certificates[0]
 				c.CertCache.SetDefault(domainsKey, cert)
 				return cert
 			}
@@ -175,6 +209,9 @@ func (c *CertificateStore) GetCertificate(domains []string) *CertificateData {
 func (c *CertificateStore) ResetCache() {
 	if c.CertCache != nil {
 		c.CertCache.Flush()
+	}
+	if c.certificateCandidatesCache != nil {
+		c.certificateCandidatesCache.Flush()
 	}
 }
 
@@ -200,29 +237,26 @@ func (c *CertificateStore) getDefaultCertificateDomains() []string {
 }
 
 // appendCertificate appends a Certificate to a certificates map keyed by store name.
-func appendCertificate(certs map[string]map[string]*CertificateData, subjectAltNames []string, storeName string, cert *CertificateData) {
+func appendCertificate(certs map[string]dynamicCertificates, subjectAltNames []string, storeName string, cert *CertificateData) {
 	// Guarantees the order to produce a unique cert key.
 	sort.Strings(subjectAltNames)
 	certKey := strings.Join(subjectAltNames, ",")
 
-	certExists := false
 	if certs[storeName] == nil {
-		certs[storeName] = make(map[string]*CertificateData)
-	} else {
-		for domains := range certs[storeName] {
-			if domains == certKey {
-				certExists = true
-				break
-			}
+		certs[storeName] = make(dynamicCertificates)
+	}
+
+	for _, existing := range certs[storeName][certKey] {
+		if existing.Certificate == cert.Certificate ||
+			(len(existing.Certificate.Certificate) > 0 && len(cert.Certificate.Certificate) > 0 &&
+				bytes.Equal(existing.Certificate.Certificate[0], cert.Certificate.Certificate[0])) {
+			log.Debug().Msgf("Skipping addition of certificate for domain(s) %q, to TLS Store %s, as it already exists for this store.", certKey, storeName)
+			return
 		}
 	}
-	if certExists {
-		log.Debug().Msgf("Skipping addition of certificate for domain(s) %q, to TLS Store %s, as it already exists for this store.", certKey, storeName)
-	} else {
-		log.Debug().Msgf("Adding certificate for domain(s) %s", certKey)
 
-		certs[storeName][certKey] = cert
-	}
+	log.Debug().Msgf("Adding certificate for domain(s) %s", certKey)
+	certs[storeName][certKey] = append(certs[storeName][certKey], cert)
 }
 
 func parseCertificate(cert *Certificate) (tls.Certificate, []string, error) {

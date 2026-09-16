@@ -1,8 +1,17 @@
 package tls
 
 import (
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
+	"math/big"
 	"strings"
 	"testing"
 	"time"
@@ -58,12 +67,12 @@ func TestGetBestCertificate(t *testing.T) {
 	for _, test := range testCases {
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
-			dynamicMap := map[string]*CertificateData{}
+			dynamicMap := dynamicCertificates{}
 
 			if test.dynamicCert != "" {
 				cert, err := loadTestCert(test.dynamicCert, test.uppercase)
 				require.NoError(t, err)
-				dynamicMap[strings.ToLower(test.dynamicCert)] = &CertificateData{Certificate: cert}
+				dynamicMap[strings.ToLower(test.dynamicCert)] = []*CertificateData{{Certificate: cert}}
 			}
 
 			store := &CertificateStore{
@@ -97,9 +106,9 @@ func TestGetBestCertificate_SharedSAN(t *testing.T) {
 	// Both certificates have a SAN matching app.example.test, but the exact-only
 	// certificate must always win as its identifier sorts last.
 	for range 100 {
-		dynamicMap := map[string]*CertificateData{
-			"*.app.example.test,app.example.test": wildcardCert,
-			"app.example.test":                    exactCert,
+		dynamicMap := dynamicCertificates{
+			"*.app.example.test,app.example.test": {wildcardCert},
+			"app.example.test":                    {exactCert},
 		}
 
 		store := &CertificateStore{
@@ -110,6 +119,108 @@ func TestGetBestCertificate_SharedSAN(t *testing.T) {
 		clientHello := &tls.ClientHelloInfo{ServerName: "app.example.test"}
 		assert.Same(t, exactCert.Certificate, store.GetBestCertificate(clientHello))
 	}
+}
+
+func TestGetBestCertificate_SignatureSchemePreference(t *testing.T) {
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	ecdsaKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	rsaCert := newTestCertificate(t, "server.example.com", rsaKey)
+	ecdsaCert := newTestCertificate(t, "server.example.com", ecdsaKey)
+
+	store := NewCertificateStore(nil)
+	store.DynamicCerts.Set(dynamicCertificates{
+		"server.example.com": {
+			{Certificate: rsaCert},
+			{Certificate: ecdsaCert},
+		},
+	})
+
+	testCases := []struct {
+		desc             string
+		signatureSchemes []tls.SignatureScheme
+		expected         *tls.Certificate
+	}{
+		{
+			desc:             "RSA only",
+			signatureSchemes: []tls.SignatureScheme{tls.PSSWithSHA256},
+			expected:         rsaCert,
+		},
+		{
+			desc:             "ECDSA only",
+			signatureSchemes: []tls.SignatureScheme{tls.ECDSAWithP256AndSHA256},
+			expected:         ecdsaCert,
+		},
+		{
+			desc:             "client prefers ECDSA",
+			signatureSchemes: []tls.SignatureScheme{tls.ECDSAWithP256AndSHA256, tls.PSSWithSHA256},
+			expected:         ecdsaCert,
+		},
+		{
+			desc:             "client prefers RSA",
+			signatureSchemes: []tls.SignatureScheme{tls.PSSWithSHA256, tls.ECDSAWithP256AndSHA256},
+			expected:         rsaCert,
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			clientHello := &tls.ClientHelloInfo{
+				ServerName:        "server.example.com",
+				SupportedVersions: []uint16{tls.VersionTLS13},
+				SignatureSchemes:  test.signatureSchemes,
+			}
+
+			assert.Same(t, test.expected, store.GetBestCertificate(clientHello))
+		})
+	}
+}
+
+func TestAppendCertificate_SharedSAN(t *testing.T) {
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	ecdsaKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	rsaCert := &CertificateData{Certificate: newTestCertificate(t, "server.example.com", rsaKey)}
+	ecdsaCert := &CertificateData{Certificate: newTestCertificate(t, "server.example.com", ecdsaKey)}
+	certificates := make(map[string]dynamicCertificates)
+
+	appendCertificate(certificates, []string{"server.example.com"}, DefaultTLSStoreName, rsaCert)
+	appendCertificate(certificates, []string{"server.example.com"}, DefaultTLSStoreName, ecdsaCert)
+	appendCertificate(certificates, []string{"server.example.com"}, DefaultTLSStoreName, rsaCert)
+
+	assert.Equal(t, []*CertificateData{rsaCert, ecdsaCert}, certificates[DefaultTLSStoreName]["server.example.com"])
+}
+
+func newTestCertificate(t *testing.T, domain string, privateKey crypto.Signer) *tls.Certificate {
+	t.Helper()
+
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: domain},
+		DNSNames:     []string{domain},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, template, template, privateKey.Public(), privateKey)
+	require.NoError(t, err)
+
+	keyBytes, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	require.NoError(t, err)
+
+	certificate, err := tls.X509KeyPair(
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes}),
+		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyBytes}),
+	)
+	require.NoError(t, err)
+
+	return &certificate
 }
 
 func loadTestCert(certName string, uppercase bool) (*tls.Certificate, error) {

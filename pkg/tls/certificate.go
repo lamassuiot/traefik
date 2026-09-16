@@ -50,6 +50,9 @@ var (
 		`SecP256r1MLKEM768`:  tls.SecP256r1MLKEM768,
 		`secp384r1mlkem1024`: tls.SecP384r1MLKEM1024,
 		`SecP384r1MLKEM1024`: tls.SecP384r1MLKEM1024,
+		// Post-quantum pure key exchanges
+		"mlkem1024": tls.MLKEM1024,
+		"MLKEM1024": tls.MLKEM1024,
 	}
 )
 
