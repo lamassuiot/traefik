@@ -821,10 +821,26 @@ func (p *Provider) loadGatewayListeners(ctx context.Context, gateway *gatev1.Gat
 // listener behind the TLS configuration of an HTTPS one.
 //
 // TODO: The Gateway frontend TLS configuration (client certificate validation) has to be part of it once supported.
-// TODO: The listener TLS options (listener.TLS.Options) have to be part of it once supported.
+// The listener TLS options are not part of it: listeners sharing a parent router must agree on
+// listenerTLSOptionsKey (see buildListenerRouters).
 type uniqListener struct {
 	epName   string
 	protocol gatev1.ProtocolType
+}
+
+// listenerTLSOptionsKey is the listener.tls.options key selecting the TLS options of an HTTPS
+// listener: "default" for the default TLS options (which a TLSOption named default overrides), or
+// the qualified name of a TLS options set, e.g. "traefik-system-pqc@kubernetescrd".
+// Without it, the listener gets its own default TLS options, isolated from the other providers.
+const listenerTLSOptionsKey gatev1.AnnotationKey = "traefik.io/tls-options"
+
+// listenerTLSOptions returns the listenerTLSOptionsKey value of a listener, "" when unset.
+func listenerTLSOptions(listener *gatewayListener) string {
+	if listener.TLS == nil {
+		return ""
+	}
+
+	return string(listener.TLS.Options[listenerTLSOptionsKey])
 }
 
 // buildListenerRouters builds a parent router per entry point hostname, scoped to the requests it
@@ -866,6 +882,9 @@ func (p *Provider) buildListenerRouters(gateways []gatewayWithListeners, conf *d
 				EntryPoints: []string{uniq.epName},
 			}
 
+			// The parent router serves every Gateway electing a listener for this hostname,
+			// so their TLS options references must agree to be honored.
+			tlsOptionsRefs := map[string]struct{}{}
 			for _, gateway := range gateways {
 				listener := mostSpecificListener(gateway.listeners, uniq, hostname)
 				if listener == nil {
@@ -873,16 +892,33 @@ func (p *Provider) buildListenerRouters(gateways []gatewayWithListeners, conf *d
 				}
 
 				listener.RouterNames = append(listener.RouterNames, listenerRouterName)
+				tlsOptionsRefs[listenerTLSOptions(listener)] = struct{}{}
 			}
 
 			if uniq.protocol == gatev1.HTTPSProtocolType {
-				listenerTLSOptions := tls.Options{}
-				listenerTLSOptions.SetDefaults()
+				var tlsOptionsRef string
+				if len(tlsOptionsRefs) == 1 {
+					for ref := range tlsOptionsRefs {
+						tlsOptionsRef = ref
+					}
+				} else if len(tlsOptionsRefs) > 1 {
+					log.Warn().Str("entryPoint", uniq.epName).Str("hostname", hostname).
+						Msgf("Listeners sharing the entry point disagree on %s, using isolated default TLS options", listenerTLSOptionsKey)
+				}
 
-				conf.TLS.Options[listenerRouterName] = listenerTLSOptions
+				if tlsOptionsRef != "" {
+					listenerRouter.TLS = &dynamic.RouterTLSConfig{
+						Options: tlsOptionsRef,
+					}
+				} else {
+					isolatedTLSOptions := tls.Options{}
+					isolatedTLSOptions.SetDefaults()
 
-				listenerRouter.TLS = &dynamic.RouterTLSConfig{
-					Options: listenerRouterName,
+					conf.TLS.Options[listenerRouterName] = isolatedTLSOptions
+
+					listenerRouter.TLS = &dynamic.RouterTLSConfig{
+						Options: listenerRouterName,
+					}
 				}
 			}
 
