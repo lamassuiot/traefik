@@ -4,6 +4,7 @@ import (
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/mldsa"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -178,6 +179,110 @@ func TestGetBestCertificate_SignatureSchemePreference(t *testing.T) {
 	}
 }
 
+func TestGetBestCertificate_PostQuantum(t *testing.T) {
+	ecdsaKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	mldsaKey, err := mldsa.GenerateKey(mldsa.MLDSA65())
+	require.NoError(t, err)
+
+	ecdsaCert := newTestCertificate(t, "server.example.com", ecdsaKey)
+	mldsaCert := newTestCertificate(t, "server.example.com", mldsaKey)
+
+	store := NewCertificateStore(nil)
+	store.DynamicCerts.Set(dynamicCertificates{
+		"server.example.com": {
+			{Certificate: ecdsaCert},
+			{Certificate: mldsaCert},
+		},
+	})
+
+	testCases := []struct {
+		desc              string
+		supportedVersions []uint16
+		signatureSchemes  []tls.SignatureScheme
+		expected          *tls.Certificate
+	}{
+		{
+			desc:              "classical client",
+			supportedVersions: []uint16{tls.VersionTLS13},
+			signatureSchemes:  []tls.SignatureScheme{tls.ECDSAWithP256AndSHA256, tls.PSSWithSHA256},
+			expected:          ecdsaCert,
+		},
+		{
+			desc:              "post-quantum client",
+			supportedVersions: []uint16{tls.VersionTLS13},
+			signatureSchemes:  []tls.SignatureScheme{tls.MLDSA65, tls.ECDSAWithP256AndSHA256},
+			expected:          mldsaCert,
+		},
+		{
+			desc:              "post-quantum only client",
+			supportedVersions: []uint16{tls.VersionTLS13},
+			signatureSchemes:  []tls.SignatureScheme{tls.MLDSA65},
+			expected:          mldsaCert,
+		},
+		{
+			desc:              "client prefers classical",
+			supportedVersions: []uint16{tls.VersionTLS13},
+			signatureSchemes:  []tls.SignatureScheme{tls.ECDSAWithP256AndSHA256, tls.MLDSA65},
+			expected:          ecdsaCert,
+		},
+		{
+			desc:              "ML-DSA is not allowed in TLS 1.2",
+			supportedVersions: []uint16{tls.VersionTLS12},
+			signatureSchemes:  []tls.SignatureScheme{tls.MLDSA65, tls.ECDSAWithP256AndSHA256},
+			expected:          ecdsaCert,
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			clientHello := &tls.ClientHelloInfo{
+				ServerName:        "server.example.com",
+				SupportedVersions: test.supportedVersions,
+				SignatureSchemes:  test.signatureSchemes,
+				SupportedCurves:   []tls.CurveID{tls.CurveP256},
+				SupportedPoints:   []uint8{0},
+				CipherSuites:      []uint16{tls.TLS_AES_128_GCM_SHA256, tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
+			}
+
+			assert.Same(t, test.expected, store.GetBestCertificate(clientHello))
+		})
+	}
+}
+
+func TestGetBestCertificate_CommonNameOnly(t *testing.T) {
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	ecdsaKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	commonNameOnlyCert := newTestCertificateFromTemplate(t, &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "server.example.com"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}, rsaKey)
+	ecdsaCert := newTestCertificate(t, "server.example.com", ecdsaKey)
+
+	store := NewCertificateStore(nil)
+	store.DynamicCerts.Set(dynamicCertificates{
+		"server.example.com": {
+			{Certificate: ecdsaCert},
+			{Certificate: commonNameOnlyCert},
+		},
+	})
+
+	clientHello := &tls.ClientHelloInfo{
+		ServerName:        "server.example.com",
+		SupportedVersions: []uint16{tls.VersionTLS13},
+		SignatureSchemes:  []tls.SignatureScheme{tls.PSSWithSHA256, tls.ECDSAWithP256AndSHA256},
+	}
+
+	assert.Same(t, commonNameOnlyCert, store.GetBestCertificate(clientHello))
+}
+
 func TestAppendCertificate_SharedSAN(t *testing.T) {
 	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	require.NoError(t, err)
@@ -198,7 +303,7 @@ func TestAppendCertificate_SharedSAN(t *testing.T) {
 func newTestCertificate(t *testing.T, domain string, privateKey crypto.Signer) *tls.Certificate {
 	t.Helper()
 
-	template := &x509.Certificate{
+	return newTestCertificateFromTemplate(t, &x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject:      pkix.Name{CommonName: domain},
 		DNSNames:     []string{domain},
@@ -206,7 +311,11 @@ func newTestCertificate(t *testing.T, domain string, privateKey crypto.Signer) *
 		NotAfter:     time.Now().Add(time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-	}
+	}, privateKey)
+}
+
+func newTestCertificateFromTemplate(t *testing.T, template *x509.Certificate, privateKey crypto.Signer) *tls.Certificate {
+	t.Helper()
 
 	derBytes, err := x509.CreateCertificate(rand.Reader, template, template, privateKey.Public(), privateKey)
 	require.NoError(t, err)

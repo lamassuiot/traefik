@@ -124,12 +124,22 @@ func (c *CertificateStore) GetBestCertificate(clientHello *tls.ClientHelloInfo) 
 		return nil
 	}
 
+	// A single candidate keeps the historical behavior: there is nothing to negotiate.
+	if len(candidates) == 1 {
+		return c.prepareCertificate(candidates[0])
+	}
+
+	// The server name has already been matched by matchDomain, which honors the Common Name.
+	// SupportsCertificate would re-check it with VerifyHostname, which ignores the Common Name since Go 1.15,
+	// and is the breaking change that got upstream PR #8674 declined.
+	probe := *clientHello
+	probe.ServerName = ""
+
 	// Do not cache this result because clients for the same hostname can advertise different signature schemes.
 	// Trying one signature scheme at a time makes the client preference order
 	// drive certificate selection while SupportsCertificate applies all the
 	// other TLS compatibility checks.
 	for _, signatureScheme := range clientHello.SignatureSchemes {
-		probe := *clientHello
 		probe.SignatureSchemes = []tls.SignatureScheme{signatureScheme}
 
 		for _, candidate := range candidates {
@@ -141,7 +151,7 @@ func (c *CertificateStore) GetBestCertificate(clientHello *tls.ClientHelloInfo) 
 
 	if len(clientHello.SignatureSchemes) == 0 {
 		for _, candidate := range candidates {
-			if err := clientHello.SupportsCertificate(candidate.Certificate); err == nil {
+			if err := probe.SupportsCertificate(candidate.Certificate); err == nil {
 				return c.prepareCertificate(candidate)
 			}
 		}

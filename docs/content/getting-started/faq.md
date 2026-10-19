@@ -178,18 +178,26 @@ This identifier is constructed as the alphabetically ordered concatenation of th
 The identifier is used to store TLS certificates in order to be later used to handle TLS connections.
 This operation happens each time there are configuration changes.
 
-If multiple TLS certificates are provided with the same SANs definition (same identifier), only the one processed first is kept.
-Because the dynamic configuration is aggregated from all providers,
-when processing it to gather TLS certificates,
-there is no guarantee of the order in which they would be processed.
-This means that along with configurations applied, it is possible that the TLS certificate retained for a given identifier differs.
+Multiple TLS certificates can share the same SANs definition (same identifier),
+for example an ECDSA, an RSA, and an ML-DSA certificate for the same domain.
+They are all kept under that identifier, and the one served is chosen per connection, as described below.
+Only an exact duplicate (same leaf certificate) is skipped.
 
 ### Serving TLS Certificates
 
 For each incoming connection, Traefik is serving the "best" matching TLS certificate for the provided server name.
 
 The TLS certificate selection process narrows down the list of TLS certificates matching the server name,
-and then selects the last TLS certificate in this list after having ordered it by the identifier alphabetically.
+and then orders it by identifier, in reverse alphabetical order.
+
+When only one TLS certificate matches, it is served.
+
+When several TLS certificates match, Traefik walks through the signature algorithms advertised by the client,
+in the client's order of preference,
+and serves the first TLS certificate in the ordered list that the client can use with that algorithm.
+This lets a classical client receive an ECDSA or RSA certificate
+while a post-quantum client receives an ML-DSA certificate for the same domain.
+If the client can use none of them, the first TLS certificate in the ordered list is served, and the handshake fails.
 
 #### Examples:
 
@@ -203,8 +211,9 @@ and then selects the last TLS certificate in this list after having ordered it b
 While Traefik is serving the best matching TLS certificate for each incoming connection,
 the selection process cost for each incoming connection is avoided thanks to a cache mechanism.
 
-Once a TLS certificate has been selected as the "best" TLS certificate for a server name,
-it is cached for an hour, avoiding the selection process for further connections.
+Once the TLS certificates matching a server name have been found,
+the list is cached for an hour, avoiding the server name matching for further connections.
+The choice among them is not cached, because clients connecting to the same server name can advertise different signature algorithms.
 
 Nonetheless, when a new configuration is applied, the cache is reset.
 
